@@ -1,0 +1,209 @@
+diff --git a/Loop/Loop/Managers/LoopDataManager.swift b/Loop/Loop/Managers/LoopDataManager.swift
+index c9aef28..ef1aef8 100644
+--- a/Loop/Loop/Managers/LoopDataManager.swift
++++ b/Loop/Loop/Managers/LoopDataManager.swift
+@@ -885,6 +885,9 @@ extension LoopDataManager {
+ 
+             var (dosingDecision, error) = self.update(for: .loop)
+ 
++            // Adaptive Loop shadow: a read-only copy of what Loop is about to enact (never fed back).
++            let adaptiveShadowRecommendation = self.recommendedAutomaticDose?.recommendation
++
+             if error == nil, self.automaticDosingStatus.automaticDosingEnabled == true {
+                 error = self.enactRecommendedAutomaticDose()
+             } else {
+@@ -892,6 +895,12 @@ extension LoopDataManager {
+             }
+ 
+             self.finishLoop(startDate: startDate, dosingDecision: dosingDecision, error: error)
++
++            if AdaptiveShadow.enabled {
++                self.recordAdaptiveShadow(recommendation: adaptiveShadowRecommendation,
++                                          closedLoop: self.automaticDosingStatus.automaticDosingEnabled,
++                                          loopFailed: error != nil)
++            }
+         }
+     }
+ 
+@@ -2275,6 +2284,8 @@ extension LoopDataManager {
+                 "",
+             ]
+ 
++            entries.append(contentsOf: AdaptiveShadow.reportLines(days: 7))
++
+             self.glucoseStore.generateDiagnosticReport { (report) in
+                 entries.append(report)
+                 entries.append("")
+@@ -2614,3 +2625,172 @@ extension LoopDataManager: ServicesManagerDelegate {
+     }
+     
+ }
++
++
++// MARK: - Adaptive Loop research shadow (never doses)
++
++/// Adaptive Loop research shadow, added by a patch in this build.
++///
++/// After each loop it records what the "stacking rule" would have let through of the automatic insulin
++/// Loop just gave: for 2 h after a hand bolus of 1 U or more, half of Loop's automatic insulin; none
++/// within 30 min of a reading under 70. It runs after Loop has already enacted its dose, on its own
++/// low-priority queue, and nothing it computes is read by Loop. Set `enabled` to false and rebuild to
++/// switch it off. Same rule as research/adaptiveloop/guard/stacking.py.
++enum AdaptiveShadow {
++    static let enabled = true
++    static let version = 1
++    static let windowSeconds: TimeInterval = 2 * 60 * 60
++    static let handMinUnits = 1.0
++    static let passFactor = 0.5
++    static let recentLowMgdl = 70.0
++    static let recentLowSeconds: TimeInterval = 30 * 60
++    static let maxFileBytes = 20_000_000
++
++    static let queue = DispatchQueue(label: "org.adaptiveloop.shadow", qos: .utility)
++    fileprivate static var busySince: Date?            // only touched on `queue`
++
++    /// Pure rule: the allowed share of Loop's automatic extra insulin. Never more than Loop gave.
++    static func allowedExtra(loopExtra: Double, handInWindow: Double, minGlucose30: Double?) -> (allowed: Double, reasons: [String]) {
++        let loop = loopExtra.isFinite ? max(loopExtra, 0) : 0
++        var allowed = loop
++        var reasons: [String] = []
++        if handInWindow.isFinite, handInWindow >= handMinUnits, loop > 0 {
++            allowed = min(allowed, passFactor * loop)
++            reasons.append("stacking")
++        }
++        if let glucose = minGlucose30, glucose.isFinite, glucose < recentLowMgdl, allowed > 0 {
++            allowed = 0
++            reasons.append("recent_low")
++        }
++        return (min(max(allowed, 0), loop), reasons)
++    }
++
++    static var directory: URL? {
++        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
++            .appendingPathComponent("AdaptiveShadow", isDirectory: true)
++    }
++
++    static var logURL: URL? {
++        directory?.appendingPathComponent("stacking_shadow.jsonl")
++    }
++
++    /// Appends one JSON line. Call on `queue`. Any failure is dropped: the shadow must never affect Loop.
++    static func append(_ object: [String: Any]) {
++        guard let dir = directory, let url = logURL,
++              JSONSerialization.isValidJSONObject(object),
++              let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
++            return
++        }
++        do {
++            let fileManager = FileManager.default
++            try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
++            if let size = (try? fileManager.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue,
++               size > maxFileBytes {
++                let previous = dir.appendingPathComponent("stacking_shadow.previous.jsonl")
++                try? fileManager.removeItem(at: previous)
++                try fileManager.moveItem(at: url, to: previous)
++            }
++            if !fileManager.fileExists(atPath: url.path) {
++                _ = fileManager.createFile(atPath: url.path, contents: nil)
++            }
++            let handle = try FileHandle(forWritingTo: url)
++            defer { try? handle.close() }
++            _ = try handle.seekToEnd()
++            var line = data
++            line.append(contentsOf: [0x0A])
++            try handle.write(contentsOf: line)
++        } catch {
++            return
++        }
++    }
++
++    /// The last `days` of shadow lines, for Share Diagnostic Report.
++    static func reportLines(days: Double) -> [String] {
++        var lines = ["## AdaptiveShadow (research; never doses)",
++                     "enabled: \(enabled), version: \(version)"]
++        guard let url = logURL, let text = try? String(contentsOf: url, encoding: .utf8) else {
++            lines.append("no shadow log yet")
++            lines.append("")
++            return lines
++        }
++        let cutoff = Date().addingTimeInterval(-days * 24 * 60 * 60).timeIntervalSince1970
++        for line in text.split(separator: "\n") {
++            guard let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
++                  let ts = object["ts"] as? Double, ts >= cutoff else {
++                continue
++            }
++            lines.append(String(line))
++        }
++        lines.append("")
++        return lines
++    }
++}
++
++extension LoopDataManager {
++    /// Called on `dataAccessQueue` after the loop finished. Copies what it needs, then works on the shadow queue.
++    fileprivate func recordAdaptiveShadow(recommendation: AutomaticDoseRecommendation?, closedLoop: Bool, loopFailed: Bool) {
++        let date = now()
++        let scheduledRate = settings.basalRateSchedule?.value(at: date)
++        let iob = insulinOnBoard?.value
++        let bolus = recommendation?.bolusUnits ?? 0
++        let tempRate = recommendation?.basalAdjustment?.unitsPerHour
++        let doseStore = self.doseStore
++        let glucoseStore = self.glucoseStore
++
++        AdaptiveShadow.queue.async {
++            if let since = AdaptiveShadow.busySince, Date().timeIntervalSince(since) < 120 {
++                return                                          // previous record still running: skip this one
++            }
++            AdaptiveShadow.busySince = Date()
++            doseStore.getNormalizedDoseEntries(start: date.addingTimeInterval(-AdaptiveShadow.windowSeconds), end: date) { doseResult in
++                glucoseStore.getGlucoseSamples(start: date.addingTimeInterval(-AdaptiveShadow.recentLowSeconds), end: date) { glucoseResult in
++                    AdaptiveShadow.queue.async {
++                        defer { AdaptiveShadow.busySince = nil }
++                        var hand = 0.0
++                        var doseQueryOK = false
++                        if case .success(let doses) = doseResult {
++                            doseQueryOK = true
++                            hand = doses
++                                .filter { $0.type == .bolus && $0.automatic != true && $0.startDate <= date }
++                                .reduce(0.0) { $0 + ($1.deliveredUnits ?? $1.programmedUnits) }
++                        }
++                        var latest: Double?
++                        var lowest: Double?
++                        if case .success(let samples) = glucoseResult {
++                            let values = samples
++                                .sorted { $0.startDate < $1.startDate }
++                                .map { $0.quantity.doubleValue(for: .milligramsPerDeciliter) }
++                            latest = values.last
++                            lowest = values.min()
++                        }
++                        var tempExtra = 0.0
++                        if let rate = tempRate, let scheduled = scheduledRate, rate > scheduled {
++                            tempExtra = (rate - scheduled) * 5.0 / 60.0
++                        }
++                        let loopExtra = bolus + tempExtra
++                        let rule = AdaptiveShadow.allowedExtra(loopExtra: loopExtra, handInWindow: hand, minGlucose30: lowest)
++                        let record: [String: Any] = [
++                            "v": AdaptiveShadow.version,
++                            "ts": date.timeIntervalSince1970,
++                            "closed_loop": closedLoop,
++                            "loop_failed": loopFailed,
++                            "glucose": latest ?? NSNull(),
++                            "glucose_min_30m": lowest ?? NSNull(),
++                            "loop_bolus": bolus,
++                            "loop_temp_rate": tempRate ?? NSNull(),
++                            "scheduled_rate": scheduledRate ?? NSNull(),
++                            "loop_extra": loopExtra,
++                            "hand_bolus_2h": hand,
++                            "dose_query_ok": doseQueryOK,
++                            "iob": iob ?? NSNull(),
++                            "rule_allowed_extra": rule.allowed,
++                            "rule_held": loopExtra - rule.allowed,
++                            "rule_reasons": rule.reasons,
++                        ]
++                        AdaptiveShadow.append(record)
++                    }
++                }
++            }
++        }
++    }
++}
