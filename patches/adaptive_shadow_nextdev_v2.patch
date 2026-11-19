@@ -1,0 +1,242 @@
+diff --git a/Loop/Loop/Managers/LoopDataManager.swift b/Loop/Loop/Managers/LoopDataManager.swift
+index 185779a..ed96bf1 100644
+--- a/Loop/Loop/Managers/LoopDataManager.swift
++++ b/Loop/Loop/Managers/LoopDataManager.swift
+@@ -429,6 +429,11 @@ final class LoopDataManager: ObservableObject {
+         // "loop" decision by NightscoutService). Runs for both success and error paths.
+         await updateDisplayState(forceStoreRemoteRecommendation: true)
+ 
++        // Adaptive Loop research shadow: records what a reduce-only rule would have allowed. Never doses.
++        if AdaptiveShadow.enabled {
++            recordAdaptiveShadow(outcome: outcome, at: loopBaseTime)
++        }
++
+         logger.default("Loop ended")
+     }
+ 
+@@ -1195,7 +1200,11 @@ extension LoopDataManager: DiagnosticReportGenerator {
+             "volatilityBaseline: \(String(describing: algoInput?.volatilityBaseline))",
+             ""
+             ]
+-        return entries.joined(separator: "\n")
++        var adaptiveShadowLines: [String] = []
++        if AdaptiveShadow.enabled {
++            adaptiveShadowLines = await AdaptiveShadow.reportLines(days: AdaptiveShadow.reportDays)
++        }
++        return (entries + adaptiveShadowLines).joined(separator: "\n")
+ 
+     }
+ }
+@@ -1256,3 +1265,212 @@ extension LoopDataManager: AutomationHistoryProvider {
+         return automationHistory.toTimeline(from: start, to: end)
+     }
+ }
++
++
++// MARK: - Adaptive Loop research shadow (never doses)
++
++/// Adaptive Loop research shadow, added by a patch in this build (next-dev version).
++///
++/// After each loop cycle it records what the "stacking rule" would have let through of the automatic
++/// insulin Loop just chose: for 2 h after a hand bolus of 1 U or more, half of Loop's automatic extra
++/// insulin; none within 30 min of a reading under 70. It runs after the cycle has finished and dosed,
++/// and nothing it computes is read by Loop. Set `enabled` to false and rebuild to switch it off.
++/// Same rule as research/adaptiveloop/guard/stacking.py.
++enum AdaptiveShadow {
++    static let enabled = true
++    static let version = 2
++    static let windowSeconds: TimeInterval = 2 * 60 * 60
++    static let handMinUnits = 1.0
++    static let passFactor = 0.5
++    static let recentLowMgdl = 70.0
++    static let recentLowSeconds: TimeInterval = 30 * 60
++    static let reportDays = 28.0
++    static let maxFileBytes = 20_000_000
++
++    /// File reads and writes happen here, off the main thread.
++    static let queue = DispatchQueue(label: "org.adaptiveloop.shadow", qos: .utility)
++
++    /// Set while a record is being gathered, so a slow query can't pile records up.
++    @MainActor static var busySince: Date?
++
++    /// Pure rule: the allowed share of Loop's automatic extra insulin. Never more than Loop gave.
++    static func allowedExtra(loopExtra: Double, handInWindow: Double, minGlucose30: Double?) -> (allowed: Double, reasons: [String]) {
++        let loop = loopExtra.isFinite ? max(loopExtra, 0) : 0
++        var allowed = loop
++        var reasons: [String] = []
++        if handInWindow.isFinite, handInWindow >= handMinUnits, loop > 0 {
++            allowed = min(allowed, passFactor * loop)
++            reasons.append("stacking")
++        }
++        if let glucose = minGlucose30, glucose.isFinite, glucose < recentLowMgdl, allowed > 0 {
++            allowed = 0
++            reasons.append("recent_low")
++        }
++        return (min(max(allowed, 0), loop), reasons)
++    }
++
++    static var directory: URL? {
++        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
++            .appendingPathComponent("AdaptiveShadow", isDirectory: true)
++    }
++
++    static var logURL: URL? {
++        directory?.appendingPathComponent("stacking_shadow.jsonl")
++    }
++
++    static var previousLogURL: URL? {
++        directory?.appendingPathComponent("stacking_shadow.previous.jsonl")
++    }
++
++    /// One JSON line, or nil if the object can't be encoded.
++    static func encode(_ object: [String: Any]) -> Data? {
++        guard JSONSerialization.isValidJSONObject(object),
++              var data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else {
++            return nil
++        }
++        data.append(contentsOf: [0x0A])
++        return data
++    }
++
++    /// Appends one line. Call on `queue`. Any failure is dropped: the shadow must never affect Loop.
++    static func write(_ line: Data) {
++        guard let dir = directory, let url = logURL, let previous = previousLogURL else {
++            return
++        }
++        do {
++            let fileManager = FileManager.default
++            try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
++            if let size = (try? fileManager.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.intValue,
++               size > maxFileBytes {
++                try? fileManager.removeItem(at: previous)
++                try fileManager.moveItem(at: url, to: previous)
++            }
++            if !fileManager.fileExists(atPath: url.path) {
++                _ = fileManager.createFile(atPath: url.path, contents: nil)
++            }
++            let handle = try FileHandle(forWritingTo: url)
++            defer { try? handle.close() }
++            _ = try handle.seekToEnd()
++            try handle.write(contentsOf: line)
++        } catch {
++            return
++        }
++    }
++
++    /// The last `days` of shadow lines for the Issue Report, read on `queue`.
++    static func reportLines(days: Double) async -> [String] {
++        await withCheckedContinuation { continuation in
++            AdaptiveShadow.queue.async {
++                continuation.resume(returning: AdaptiveShadow.readLines(days: days))
++            }
++        }
++    }
++
++    /// Call on `queue`.
++    static func readLines(days: Double) -> [String] {
++        var lines = ["## AdaptiveShadow (research; never doses)",
++                     "enabled: \(enabled), version: \(version), days: \(Int(days))"]
++        let cutoff = Date().addingTimeInterval(-days * 24 * 60 * 60).timeIntervalSince1970
++        var found = 0
++        for url in [previousLogURL, logURL].compactMap({ $0 }) {
++            guard let text = try? String(contentsOf: url, encoding: .utf8) else {
++                continue
++            }
++            for line in text.split(separator: "\n") {
++                guard let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
++                      let ts = object["ts"] as? Double, ts >= cutoff else {
++                    continue
++                }
++                lines.append(String(line))
++                found += 1
++            }
++        }
++        if found == 0 {
++            lines.append("no shadow log yet")
++        }
++        lines.append("")
++        return lines
++    }
++}
++
++extension LoopDataManager {
++    /// Called at the end of `loop()`, after the cycle has dosed and the display state is updated.
++    /// Copies what it needs; the record is gathered in a separate task so `loop()` isn't held up.
++    fileprivate func recordAdaptiveShadow(outcome: LoopCycle.Outcome, at date: Date) {
++        if let since = AdaptiveShadow.busySince, Date().timeIntervalSince(since) < 120 {
++            return                                          // previous record still being gathered: skip this one
++        }
++        AdaptiveShadow.busySince = Date()
++
++        let bolus = outcome.recommendation?.bolusUnits ?? 0
++        let tempRate = outcome.recommendation?.basalAdjustment.unitsPerHour
++        let neutralRate = outcome.input?.basal.closestPrior(to: date)?.value ?? scheduledBasalRate(at: date)
++        let closedLoop = isClosedLoop
++        let enacted = outcome.enacted
++        let loopFailed = outcome.error != nil
++        let iob = activeInsulin?.value
++        let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String
++
++        Task { @MainActor [weak self] in
++            defer { AdaptiveShadow.busySince = nil }
++            guard let self else {
++                return
++            }
++
++            var hand = 0.0
++            var doseQueryOK = false
++            if let doses = try? await self.doseStore.getNormalizedDoseEntries(
++                start: date.addingTimeInterval(-AdaptiveShadow.windowSeconds), end: date) {
++                doseQueryOK = true
++                hand = doses
++                    .filter { $0.type == .bolus && $0.automatic != true && $0.startDate <= date }
++                    .reduce(0.0) { $0 + ($1.deliveredUnits ?? $1.programmedUnits) }
++            }
++
++            var latest: Double?
++            var lowest: Double?
++            if let samples = try? await self.glucoseStore.getGlucoseSamples(
++                start: date.addingTimeInterval(-AdaptiveShadow.recentLowSeconds), end: date) {
++                let values = samples
++                    .sorted { $0.startDate < $1.startDate }
++                    .map { $0.quantity.doubleValue(for: .milligramsPerDeciliter) }
++                latest = values.last
++                lowest = values.min()
++            }
++
++            var tempExtra = 0.0
++            if let rate = tempRate, let neutral = neutralRate, rate > neutral {
++                tempExtra = (rate - neutral) * 5.0 / 60.0
++            }
++            let loopExtra = bolus + tempExtra
++            let rule = AdaptiveShadow.allowedExtra(loopExtra: loopExtra, handInWindow: hand, minGlucose30: lowest)
++
++            let record: [String: Any] = [
++                "v": AdaptiveShadow.version,
++                "ts": date.timeIntervalSince1970,
++                "app_version": appVersion ?? NSNull(),
++                "closed_loop": closedLoop,
++                "enacted": enacted,
++                "loop_failed": loopFailed,
++                "glucose": latest ?? NSNull(),
++                "glucose_min_30m": lowest ?? NSNull(),
++                "loop_bolus": bolus,
++                "loop_temp_rate": tempRate ?? NSNull(),
++                "scheduled_rate": neutralRate ?? NSNull(),
++                "loop_extra": loopExtra,
++                "hand_bolus_2h": hand,
++                "dose_query_ok": doseQueryOK,
++                "iob": iob ?? NSNull(),
++                "rule_allowed_extra": rule.allowed,
++                "rule_held": loopExtra - rule.allowed,
++                "rule_reasons": rule.reasons,
++            ]
++            guard let line = AdaptiveShadow.encode(record) else {
++                return
++            }
++            AdaptiveShadow.queue.async {
++                AdaptiveShadow.write(line)
++            }
++        }
++    }
++}
